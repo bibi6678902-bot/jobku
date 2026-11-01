@@ -1,0 +1,110 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cek berkas yang dibutuhkan
+        run: |
+          for f in main.dart pubspec.yaml admin_email.txt debug.keystore.b64 google-services.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Berkas $f belum diunggah ke repository"
+              exit 1
+            fi
+          done
+          if grep -q GANTI admin_email.txt; then
+            echo "::error::admin_email.txt belum diisi dengan email admin"
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Buat kerangka proyek Android
+        run: flutter create --org com.jobku --project-name jobku --platforms=android app_build
+
+      - name: Salin kode aplikasi
+        run: |
+          cp pubspec.yaml app_build/pubspec.yaml
+          rm -rf app_build/lib app_build/test
+          mkdir app_build/lib
+          cp main.dart app_build/lib/main.dart
+
+      - name: Buat konfigurasi Firebase dari google-services.json
+        run: |
+          PKG=com.jobku.jobku
+          SEL=".client[] | select(.client_info.android_client_info.package_name==\"$PKG\")"
+          APIKEY=$(jq -r "[$SEL | .api_key[0].current_key][0] // empty" google-services.json)
+          APPID=$(jq -r "[$SEL | .client_info.mobilesdk_app_id][0] // empty" google-services.json)
+          SENDER=$(jq -r '.project_info.project_number // empty' google-services.json)
+          PROJECT=$(jq -r '.project_info.project_id // empty' google-services.json)
+          WEBID=$(jq -r "[$SEL | .oauth_client[]? | select(.client_type==3) | .client_id][0] // empty" google-services.json)
+          ADMIN=$(tr -d ' \r\n' < admin_email.txt)
+          for v in APIKEY APPID SENDER PROJECT WEBID ADMIN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Nilai $v kosong. Pastikan nama paket aplikasi Android di Firebase adalah $PKG, login Google sudah diaktifkan, SHA-1 sudah didaftarkan, lalu unduh ulang google-services.json dan unggah lagi."
+              exit 1
+            fi
+          done
+          cat > app_build/lib/firebase_config.dart <<EOF
+          import 'package:firebase_core/firebase_core.dart';
+
+          const FirebaseOptions firebaseOptions = FirebaseOptions(
+            apiKey: '$APIKEY',
+            appId: '$APPID',
+            messagingSenderId: '$SENDER',
+            projectId: '$PROJECT',
+          );
+          const String webClientId = '$WEBID';
+          const String adminEmail = '$ADMIN';
+          EOF
+
+      - name: Pengaturan Android (minSdk, izin internet, Kotlin)
+        working-directory: app_build/android
+        run: |
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' app/build.gradle
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' app/build.gradle
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' app/src/main/AndroidManifest.xml
+          sed -i -E 's/(org\.jetbrains\.kotlin\.android" version ")[0-9.]+(")/\11.9.24\2/' settings.gradle
+          sed -i -E "s/ext\.kotlin_version = '[0-9.]+'/ext.kotlin_version = '1.9.24'/" build.gradle
+          grep -n "minSdk" app/build.gradle
+          grep -n "kotlin" settings.gradle build.gradle || true
+          grep -n "INTERNET" app/src/main/AndroidManifest.xml
+
+      - name: Pakai kunci tanda tangan tetap (agar login Google stabil)
+        run: |
+          mkdir -p ~/.android
+          base64 -d debug.keystore.b64 > ~/.android/debug.keystore
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep SHA1
+
+      - name: Build APK
+        working-directory: app_build
+        run: |
+          flutter pub get
+          flutter build apk --release
+
+      - name: Siapkan berkas APK
+        run: cp app_build/build/app/outputs/flutter-apk/app-release.apk JobKu.apk
+
+      - name: Terbitkan APK di Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: JobKu build ${{ github.run_number }}
+          files: JobKu.apk
