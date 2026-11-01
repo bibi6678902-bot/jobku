@@ -69,8 +69,22 @@ List<Doc> sorted(Snap s) {
   return l;
 }
 
-bool isAdminUser(User u) =>
+bool isAdminEmail(User u) =>
     (u.email ?? '').toLowerCase() == adminEmail.toLowerCase();
+
+/// Admin harus memakai email yang sudah terverifikasi (sama seperti di rules).
+bool isAdminUser(User u) => isAdminEmail(u) && u.emailVerified;
+
+/// Nama tampilan: username atau nama Google, atau bagian depan email.
+String nameOf(User u) {
+  final n = (u.displayName ?? '').trim();
+  if (n.isNotEmpty) return n;
+  return (u.email ?? '').split('@').first;
+}
+
+/// Data pendaftaran manual (username, telepon) yang disimpan ke profil
+/// saat akun baru pertama kali dibuka.
+Map<String, String>? pendingRegistration;
 
 void toast(BuildContext c, String m) {
   ScaffoldMessenger.of(c)
@@ -212,7 +226,7 @@ class AuthGate extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
+      stream: FirebaseAuth.instance.userChanges(),
       builder: (context, snap) {
         if (snap.connectionState == ConnectionState.waiting) {
           return const Scaffold(body: Loading());
@@ -225,6 +239,34 @@ class AuthGate extends StatelessWidget {
   }
 }
 
+String authError(Object e) {
+  if (e is FirebaseAuthException) {
+    switch (e.code) {
+      case 'email-already-in-use':
+        return 'Email sudah terdaftar. Silakan masuk.';
+      case 'invalid-email':
+        return 'Format email tidak valid';
+      case 'weak-password':
+        return 'Password minimal 6 karakter';
+      case 'user-not-found':
+      case 'wrong-password':
+      case 'invalid-credential':
+        return 'Email atau password salah';
+      case 'user-disabled':
+        return 'Akun ini dinonaktifkan';
+      case 'too-many-requests':
+        return 'Terlalu banyak percobaan, coba lagi nanti';
+      case 'network-request-failed':
+        return 'Tidak ada koneksi internet';
+      case 'operation-not-allowed':
+        return 'Login email/password belum diaktifkan di Firebase';
+      default:
+        return 'Gagal: ${e.code}';
+    }
+  }
+  return errText(e);
+}
+
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
   @override
@@ -232,7 +274,26 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
+  final usernameC = TextEditingController();
+  final emailC = TextEditingController();
+  final phoneC = TextEditingController();
+  final passC = TextEditingController();
+  bool register = false;
+  bool showPass = false;
   bool busy = false;
+
+  @override
+  void dispose() {
+    usernameC.dispose();
+    emailC.dispose();
+    phoneC.dispose();
+    passC.dispose();
+    super.dispose();
+  }
+
+  void _say(String m) {
+    if (mounted) toast(context, m);
+  }
 
   Future<void> _loginNative() async {
     final account = await GoogleSignIn(serverClientId: webClientId).signIn();
@@ -245,7 +306,7 @@ class _LoginPageState extends State<LoginPage> {
     await FirebaseAuth.instance.signInWithCredential(cred);
   }
 
-  Future<void> _login() async {
+  Future<void> _loginGoogle() async {
     setState(() => busy = true);
     try {
       await _loginNative();
@@ -258,16 +319,80 @@ class _LoginPageState extends State<LoginPage> {
         try {
           await FirebaseAuth.instance.signInWithProvider(GoogleAuthProvider());
         } catch (e2) {
-          if (mounted) {
-            toast(context,
-                'Login gagal: ${errText(e)} | cadangan: ${errText(e2)}');
-          }
+          _say('Login Google gagal. Silakan daftar atau masuk dengan email.');
         }
-      } else if (mounted) {
-        toast(context, 'Login gagal: ${errText(e)}');
+      } else {
+        _say('Login gagal: ${errText(e)}');
       }
     } finally {
       if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _loginPassword() async {
+    final email = emailC.text.trim();
+    final pass = passC.text;
+    if (email.isEmpty || pass.isEmpty) {
+      _say('Isi email dan password');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      await FirebaseAuth.instance
+          .signInWithEmailAndPassword(email: email, password: pass);
+    } catch (e) {
+      _say(authError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _register() async {
+    final username = usernameC.text.trim();
+    final email = emailC.text.trim();
+    final phone = phoneC.text.replaceAll(RegExp(r'\D'), '');
+    final pass = passC.text;
+    if (username.length < 3) {
+      _say('Username minimal 3 karakter');
+      return;
+    }
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
+      _say('Format email tidak valid');
+      return;
+    }
+    if (!RegExp(r'^(62|0)8\d{7,12}$').hasMatch(phone)) {
+      _say('Nomor telepon tidak valid (contoh 08123456789)');
+      return;
+    }
+    if (pass.length < 6) {
+      _say('Password minimal 6 karakter');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      pendingRegistration = {'username': username, 'phone': phone};
+      final cred = await FirebaseAuth.instance
+          .createUserWithEmailAndPassword(email: email, password: pass);
+      await cred.user?.updateDisplayName(username);
+    } catch (e) {
+      pendingRegistration = null;
+      _say(authError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _forgot() async {
+    final email = emailC.text.trim();
+    if (email.isEmpty) {
+      _say('Isi email dulu, lalu tekan Lupa password');
+      return;
+    }
+    try {
+      await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
+      _say('Link reset password dikirim ke email (cek juga folder spam).');
+    } catch (e) {
+      _say(authError(e));
     }
   }
 
@@ -276,33 +401,210 @@ class _LoginPageState extends State<LoginPage> {
     return Scaffold(
       body: SafeArea(
         child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(28),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text('💼', style: TextStyle(fontSize: 56)),
-                const SizedBox(height: 8),
-                const Text('JobKu',
-                    style:
-                        TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
-                const SizedBox(height: 8),
-                const Text(
-                  'Kerjakan job, dapatkan saldo, tarik ke DANA.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.grey),
-                ),
-                const SizedBox(height: 28),
-                busy
-                    ? const CircularProgressIndicator()
-                    : FilledButton.icon(
-                        onPressed: _login,
-                        icon: const Icon(Icons.login),
-                        label: const Text('Masuk dengan Google'),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text('💼',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 52)),
+                  const SizedBox(height: 4),
+                  const Text('JobKu',
+                      textAlign: TextAlign.center,
+                      style:
+                          TextStyle(fontSize: 28, fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Kerjakan job, dapatkan saldo, tarik ke DANA.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                  const SizedBox(height: 22),
+                  OutlinedButton.icon(
+                    onPressed: busy ? null : _loginGoogle,
+                    icon: const Icon(Icons.g_mobiledata, size: 30),
+                    label: const Text('Masuk dengan Google'),
+                  ),
+                  const SizedBox(height: 14),
+                  const Row(children: [
+                    Expanded(child: Divider()),
+                    Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 10),
+                      child: Text('atau', style: TextStyle(color: Colors.grey)),
+                    ),
+                    Expanded(child: Divider()),
+                  ]),
+                  const SizedBox(height: 14),
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('Masuk')),
+                      ButtonSegment(value: true, label: Text('Daftar')),
+                    ],
+                    selected: {register},
+                    onSelectionChanged: (s) =>
+                        setState(() => register = s.first),
+                  ),
+                  const SizedBox(height: 14),
+                  if (register) ...[
+                    TextField(
+                      controller: usernameC,
+                      decoration: const InputDecoration(
+                          labelText: 'Username',
+                          prefixIcon: Icon(Icons.person_outline),
+                          border: OutlineInputBorder()),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                  TextField(
+                    controller: emailC,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: const InputDecoration(
+                        labelText: 'Email',
+                        prefixIcon: Icon(Icons.email_outlined),
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  if (register) ...[
+                    TextField(
+                      controller: phoneC,
+                      keyboardType: TextInputType.phone,
+                      decoration: const InputDecoration(
+                          labelText: 'Nomor telepon',
+                          hintText: '08xxxxxxxxxx',
+                          prefixIcon: Icon(Icons.phone_outlined),
+                          border: OutlineInputBorder()),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                  TextField(
+                    controller: passC,
+                    obscureText: !showPass,
+                    decoration: InputDecoration(
+                      labelText: 'Password',
+                      prefixIcon: const Icon(Icons.lock_outline),
+                      border: const OutlineInputBorder(),
+                      suffixIcon: IconButton(
+                        icon: Icon(showPass
+                            ? Icons.visibility_off
+                            : Icons.visibility),
+                        onPressed: () => setState(() => showPass = !showPass),
                       ),
-              ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  FilledButton(
+                    onPressed:
+                        busy ? null : (register ? _register : _loginPassword),
+                    child: Text(busy
+                        ? 'Memproses...'
+                        : (register ? 'Daftar' : 'Masuk')),
+                  ),
+                  if (!register)
+                    TextButton(
+                      onPressed: busy ? null : _forgot,
+                      child: const Text('Lupa password?'),
+                    ),
+                ],
+              ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Akun admin (email manual) harus terverifikasi, sama seperti syarat di rules.
+class VerifyEmailPage extends StatefulWidget {
+  final User user;
+  final VoidCallback onChecked;
+  final Future<void> Function() onLogout;
+  const VerifyEmailPage({
+    super.key,
+    required this.user,
+    required this.onChecked,
+    required this.onLogout,
+  });
+  @override
+  State<VerifyEmailPage> createState() => _VerifyEmailPageState();
+}
+
+class _VerifyEmailPageState extends State<VerifyEmailPage> {
+  bool busy = false;
+
+  void _say(String m) {
+    if (mounted) toast(context, m);
+  }
+
+  Future<void> _send() async {
+    setState(() => busy = true);
+    try {
+      await widget.user.sendEmailVerification();
+      _say('Email verifikasi dikirim ke ${widget.user.email} (cek folder spam).');
+    } catch (e) {
+      _say(authError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _check() async {
+    setState(() => busy = true);
+    try {
+      await FirebaseAuth.instance.currentUser?.reload();
+      await FirebaseAuth.instance.currentUser?.getIdToken(true);
+      final ok = FirebaseAuth.instance.currentUser?.emailVerified ?? false;
+      if (ok) {
+        widget.onChecked();
+      } else {
+        _say('Email belum terverifikasi. Buka link di email dulu.');
+      }
+    } catch (e) {
+      _say(authError(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Verifikasi email admin')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Icon(Icons.mark_email_unread_outlined, size: 64),
+            const SizedBox(height: 16),
+            Text(
+              'Akun admin harus memakai email yang sudah diverifikasi.\n\n'
+              'Kirim email verifikasi ke ${widget.user.email}, buka link di '
+              'email itu, lalu tekan "Saya sudah verifikasi".',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            FilledButton.icon(
+              onPressed: busy ? null : _send,
+              icon: const Icon(Icons.send),
+              label: const Text('Kirim email verifikasi'),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: busy ? null : _check,
+              icon: const Icon(Icons.verified_outlined),
+              label: const Text('Saya sudah verifikasi'),
+            ),
+            TextButton(
+              onPressed: busy ? null : widget.onLogout,
+              child: const Text('Keluar'),
+            ),
+          ],
         ),
       ),
     );
@@ -332,10 +634,15 @@ class _HomePageState extends State<HomePage> {
       final ref = db.collection('users').doc(widget.user.uid);
       final snap = await ref.get();
       if (!snap.exists) {
+        final reg = pendingRegistration;
+        pendingRegistration = null;
+        final providers = widget.user.providerData;
         await ref.set({
-          'name': widget.user.displayName ?? '',
+          'name': reg?['username'] ?? nameOf(widget.user),
           'email': widget.user.email ?? '',
           'photo': widget.user.photoURL ?? '',
+          'phone': reg?['phone'] ?? '',
+          'provider': providers.isNotEmpty ? providers.first.providerId : '',
           'balance': 0,
           'createdAt': FieldValue.serverTimestamp(),
         });
@@ -354,7 +661,14 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final u = widget.user;
+    final u = FirebaseAuth.instance.currentUser ?? widget.user;
+    if (isAdminEmail(u) && !u.emailVerified) {
+      return VerifyEmailPage(
+        user: u,
+        onChecked: () => setState(() {}),
+        onLogout: _logout,
+      );
+    }
     final admin = isAdminUser(u);
     final pages = <Widget>[
       JobsTab(user: u),
@@ -431,7 +745,7 @@ Future<void> takeJob(BuildContext c, User u, Doc job) => guard(
           }
           tx.update(jRef, {
             'takenBy': u.uid,
-            'takenByName': u.displayName ?? '',
+            'takenByName': nameOf(u),
           });
           if (sd == null) {
             tx.set(sRef, {
@@ -439,7 +753,7 @@ Future<void> takeJob(BuildContext c, User u, Doc job) => guard(
               'jobTitle': jd['title'],
               'reward': jd['reward'],
               'uid': u.uid,
-              'userName': u.displayName ?? '',
+              'userName': nameOf(u),
               'userEmail': u.email ?? '',
               'status': 'taken',
               'createdAt': FieldValue.serverTimestamp(),
@@ -904,7 +1218,7 @@ class _WalletTabState extends State<WalletTab> {
       }
       await db.collection('withdrawals').add({
         'uid': widget.user.uid,
-        'userName': widget.user.displayName ?? '',
+        'userName': nameOf(widget.user),
         'userEmail': widget.user.email ?? '',
         'amount': amt,
         'danaNumber': dana,
@@ -1613,6 +1927,9 @@ class _AdminUsersState extends State<AdminUsers> {
                     const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
             Text('${d['email'] ?? ''}',
                 style: const TextStyle(color: Colors.black54)),
+            if ('${d['phone'] ?? ''}'.isNotEmpty)
+              Text('Telepon: ${d['phone']}',
+                  style: const TextStyle(color: Colors.black54)),
             const SizedBox(height: 6),
             Text('Saldo: ${rp(bal)}',
                 style: const TextStyle(
@@ -1650,7 +1967,9 @@ class _AdminUsersState extends State<AdminUsers> {
         if (!snap.hasData) return const Loading();
         final docs = sorted(snap.data!).where((u) {
           final m = u.data();
-          final t = '${m['name'] ?? ''} ${m['email'] ?? ''}'.toLowerCase();
+          final t =
+              '${m['name'] ?? ''} ${m['email'] ?? ''} ${m['phone'] ?? ''}'
+                  .toLowerCase();
           return q.isEmpty || t.contains(q);
         }).toList();
         return ListView(
