@@ -1,0 +1,107 @@
+name: Build Website
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cek berkas yang dibutuhkan
+        run: |
+          for f in main.dart pubspec.yaml admin_email.txt google-services.json web_app_id.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Berkas $f belum diunggah ke repository"
+              exit 1
+            fi
+          done
+          if grep -q GANTI admin_email.txt; then
+            echo "::error::admin_email.txt belum diisi dengan email admin"
+            exit 1
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Buat kerangka proyek web
+        run: flutter create --org com.jobku --project-name jobku --platforms=web web_build
+
+      - name: Salin kode aplikasi
+        run: |
+          cp pubspec.yaml web_build/pubspec.yaml
+          rm -rf web_build/lib web_build/test
+          mkdir web_build/lib
+          cp main.dart web_build/lib/main.dart
+
+      - name: Buat konfigurasi Firebase untuk web
+        run: |
+          APIKEY=$(jq -r '[.client[].api_key[0].current_key][0] // empty' google-services.json)
+          SENDER=$(jq -r '.project_info.project_number // empty' google-services.json)
+          PROJECT=$(jq -r '.project_info.project_id // empty' google-services.json)
+          WEBID=$(jq -r '[.client[].oauth_client[]? | select(.client_type==3) | .client_id][0] // empty' google-services.json)
+          APPID=$(tr -d ' \r\n' < web_app_id.txt)
+          ADMIN=$(tr -d ' \r\n' < admin_email.txt)
+          for v in APIKEY SENDER PROJECT APPID ADMIN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Nilai $v kosong. Periksa google-services.json dan web_app_id.txt."
+              exit 1
+            fi
+          done
+          case "$APPID" in
+            1:*:web:*) ;;
+            *) echo "::error::web_app_id.txt harus berisi App ID aplikasi WEB (bentuknya 1:angka:web:huruf)."; exit 1;;
+          esac
+          cat > web_build/lib/firebase_config.dart <<EOF
+          import 'package:firebase_core/firebase_core.dart';
+
+          const FirebaseOptions firebaseOptions = FirebaseOptions(
+            apiKey: '$APIKEY',
+            appId: '$APPID',
+            messagingSenderId: '$SENDER',
+            projectId: '$PROJECT',
+            authDomain: '$PROJECT.firebaseapp.com',
+            storageBucket: '$PROJECT.appspot.com',
+          );
+          const String webClientId = '$WEBID';
+          const String adminEmail = '$ADMIN';
+          EOF
+
+      - name: Build website
+        working-directory: web_build
+        run: |
+          flutter pub get
+          # Domain sendiri (bibiofficial.biz.id) berada di akar, jadi base-href "/"
+          flutter build web --release --base-href "/"
+
+      - name: Siapkan halaman 404 (agar muat ulang tidak error)
+        run: cp web_build/build/web/index.html web_build/build/web/404.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web_build/build/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
